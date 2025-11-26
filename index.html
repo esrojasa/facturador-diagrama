@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Diagrama Facturador</title>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <script>
+        mermaid.initialize({ startOnLoad: true, theme: "default" });
+    </script>
+</head>
+<body>
+<pre class="mermaid">
+sequenceDiagram
+    title Ejecución Manual de Facturación, Liquidación y Causación (MOL/DRIXI → CUD → MRC)
+
+    participant OP as Operador
+    participant API as API Backend (Spring Boot)
+    participant DB as BD Facturador (Parámetros / Logs / Totales / RetryQueue)
+    participant NRT as BD NRT DRIXI/MOL (Oracle)
+    participant CUD as Sistema CUD (RTGS)
+    participant MRC as Sistema MRC (Contable)
+    participant STG as Storage / Archivos
+
+    %% === 0️⃣ Parámetros y Reglas Previas ===
+    Note over API,DB: Parámetros mínimos ● tarifas por caso de uso ● IVA y redondeo ● periodicidad ● tipo entidad ● control acceso a logs
+
+    %% === 1️⃣ Validación Manual de Transacciones (sin importarlas) ===
+    Note over OP: Validación manual de transacciones en NRT (MOL / DRIXI)
+    OP->>API: POST /transactions/validate {fecha, componente}
+    API->>NRT: Consultar transacciones {componente, fecha}
+    NRT-->>API: Resumen transacciones (cantidad, montos, casos de uso)
+    API->>API: Validar reglas básicas (montos ≥ 0, fechas, duplicados, participante)
+    
+    alt Validación Exitosa
+        API->>DB: Insert ProcessExecutionLog(tipo="VALIDACION", estado="ÉXITO")
+        API-->>OP: 200 OK "Periodo válido para facturación"
+    else Error en validación
+        API->>DB: Insert ProcessExecutionLog(tipo="VALIDACION", estado="FALLIDO", detalleError)
+        API-->>OP: 400 "Errores de datos o ausencia de transacciones"
+    end
+
+    %% === 2️⃣ Configuración de Parámetros por Banco/Participante ===
+    Note over OP: Carga de parámetros mínimos obligatorios en BD del Facturador
+    OP->>API: POST /banks/params {tarifas, IVA, reglaRedondeo, periodicidad, tipoEntidad, vigencia}
+    API->>DB: Upsert parámetros por banco/participante y componente
+    DB-->>API: OK
+    API-->>OP: 200 OK "Parámetros actualizados"
+
+    %% === 3️⃣ Ejecución de Facturación (Cálculo en Oracle NRT) ===
+    Note over OP: Facturación consolidada por participante (prerrequisito de causación)
+    OP->>API: POST /process/manual/billing {fecha, componente}
+
+    API->>DB: Validar parámetros mínimos cargados para {componente, fecha}
+    DB-->>API: OK
+
+    API->>NRT: CALL PKG_FACTURACION.FACTURAR(componente, fecha)
+    NRT-->>API: Totales por participante + referencias a detalle
+
+    API->>DB: Insert ProcessExecutionLog(tipo="FACTURACION", estado="PENDIENTE")
+    API->>DB: Guardar totales consolidados por participante/periodo (no detalle transaccional)
+
+    alt Facturación Exitosa
+        API->>STG: Generar reportes (.txt) detallado, consolidado, GTA, conciliación
+        STG-->>API: URLs de archivos
+        API->>DB: Update ProcessExecutionLog estado="ÉXITO", archivos=URLs
+    else Error en cálculo o SP
+        API->>STG: Generar archivo errores (.txt)
+        STG-->>API: URL archivo errores
+        API->>DB: Update ProcessExecutionLog estado="FALLIDO", archivos=URL errores
+        Note over API: Re-proceso disponible vía POST /process/retry/{id} (sin retry queue)
+    end
+
+    API-->>OP: Resultado facturación {estado, archivos, idProceso}
+
+    %% === 4️⃣ Ejecución Manual de Liquidación (RTGS/CUD con Retry Queue) ===
+    Note over OP: Liquidación de montos financieros reales (independiente de causación)
+    OP->>API: POST /process/manual/liquidation {fecha, componente, participantesIncluidos, participantesExcluidos}
+
+    API->>DB: Insert ProcessExecutionLog(tipo="LIQUIDACION", estado="PENDIENTE")
+    API->>DB: Obtener totales facturados por participante/periodo
+    DB-->>API: Totales consolidados
+
+    API->>API: Aplicar exclusión manual de participantes antes de enviar a CUD
+    API->>CUD: POST /rtgs/liquidate {loteParticipantes, componente, periodo}
+    CUD-->>API: {estado:"OK"|"FALLIDO", motivo}
+
+    alt Liquidación Exitosa
+        API->>STG: Generar .txt liquidación (OK/pendientes/fallidos)
+        STG-->>API: URL archivo
+        API->>DB: Update ProcessExecutionLog estado="ÉXITO", archivoLiquidacion=URL
+    else Fallo por insuficiencia de fondos
+        API->>DB: Update ProcessExecutionLog estado="FALLIDO_NEGOCIO", motivo
+        Note over API: Reintento solo manual para esos participantes
+    else Fallo técnico (timeout, error 5xx, comunicación)
+        API->>DB: Insert en RetryQueueLiquidacion {componente, fecha, participantes, motivo}
+        API->>DB: Update ProcessExecutionLog estado="PENDIENTE_REINTENTO"
+        Note over API,DB: Retry Queue SOLO aplica a LIQUIDACIÓN
+    end
+
+    API-->>OP: Resultado liquidación {estado, archivo?, motivo}
+
+    %% === 5️⃣ Ejecución Manual de Causación (MRC - DRIXI/MOL) ===
+    Note over OP: Causación depende de FACTURACIÓN exitosa (no depende de liquidación)
+    OP->>API: POST /process/manual/causation {fecha, componente}
+
+    API->>DB: Buscar facturación exitosa por periodo/componente
+    DB-->>API: Totales consolidados por participante
+
+    API->>MRC: POST /accounting/causation {asientosConsolidados}
+    MRC-->>API: {estado:"OK"|"PARCIAL"|"ERROR", errores[]}
+
+    API->>DB: Insert ProcessExecutionLog(tipo="CAUSACION", estado="PENDIENTE")
+
+    alt Causación Exitosa
+        API->>STG: Generar .txt asientos contables generados
+        STG-->>API: URL archivo
+        API->>DB: Update ProcessExecutionLog estado="ÉXITO", archivoCausacion=URL
+    else Error o Parcial
+        API->>STG: Generar archivo .txt con errores detallados
+        STG-->>API: URL archivo errores
+        API->>DB: Update ProcessExecutionLog estado="FALLIDO", archivoErrores=URL
+        Note over API: Reintentos SOLO manuales para causación (sin retry queue)
+    end
+
+    API-->>OP: Resultado causación {estado, archivo, errores}
+
+    %% === 6️⃣ Reintentos Manuales y Retry Queue ===
+    Note over OP: Reintentos manuales en todos los procesos. Retry Queue automatizada SOLO para liquidación.
+    OP->>API: POST /process/retry/{idProceso}
+
+    API->>DB: Obtener detalle de proceso previo {tipoProceso, componente, fecha}
+    DB-->>API: Datos del proceso
+
+    alt Tipo = LIQUIDACION (reintento manual)
+        API->>CUD: Reintentar liquidación {participantes, periodo, componente}
+    else Tipo = CAUSACION
+        API->>MRC: Reintentar causación {asientosConsolidados}
+    else Tipo = FACTURACION
+        API->>NRT: Reprocesar facturación (PKG_FACTURACION.FACTURAR)
+    end
+
+    alt Reintento Exitoso
+        API->>DB: Update estado="ÉXITO"
+    else Falla Definitiva
+        API->>DB: Update estado="FALLIDO_FINAL"
+    end
+
+    API-->>OP: Resultado reintento {estadoFinal}
+
+
+</pre>
+</body>
+</html>
